@@ -44,15 +44,6 @@ type OpenAIChatMessage struct {
 	Content string `json:"content"`
 }
 
-type OpenAIChatRequest struct {
-	Model         string              `json:"model"`
-	Messages      []OpenAIChatMessage `json:"messages"`
-	Temperature   float64             `json:"temperature,omitempty"`
-	MaxTokens     int                 `json:"max_tokens,omitempty"`
-	Stream        bool                `json:"stream"`
-	StreamOptions *StreamOptions      `json:"stream_options,omitempty"`
-}
-
 type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
 }
@@ -111,15 +102,6 @@ type OllamaPsResponse struct {
 
 type OllamaVersionResponse struct {
 	Version string `json:"version"`
-}
-
-type llamaTimings struct {
-	PromptMS    float64 `json:"prompt_ms"`
-	PredictedMS float64 `json:"predicted_ms"`
-}
-type llamaUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
 }
 
 type LlamaServerManager struct {
@@ -325,12 +307,6 @@ func waitForRouterReady(baseURL string, timeout time.Duration) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
-
-// llamaBaseURL is the single source of truth for llama-server's address.
-// Computed once from the --llamaport flag at startup and reused by every
-// handler that talks to llama-server, so changing the port only requires
-// changing this one value.
-//var llamaBaseURL string
 
 var rpcHTTPClient = &http.Client{
 	Timeout: 10 * time.Minute, // Tarpeeksi pitkä aika raskaalle RPC-ajolle
@@ -1142,9 +1118,9 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 		// Not an unload signal - proceed with the existing reverse-proxy behavior
 		// for real generation requests.
 		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-		r.URL.Path = "/completion"
-		r.Host = "localhost:8080"
 		originUrl, _ := url.Parse(llamaBaseURL)
+		r.URL.Path = "/completion"
+		r.Host = originUrl.Host
 		httputil.NewSingleHostReverseProxy(originUrl).ServeHTTP(w, r)
 	})
 
@@ -1158,9 +1134,9 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 		_ = json.NewEncoder(w).Encode(OpenAIModelsResponse{Object: "list", Data: openAIModels})
 	})
 	http.HandleFunc("/openai/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		r.URL.Path = "/v1/chat/completions"
-		r.Host = "localhost:8080"
 		originUrl, _ := url.Parse(llamaBaseURL)
+		r.URL.Path = "/v1/chat/completions"
+		r.Host = originUrl.Host
 		httputil.NewSingleHostReverseProxy(originUrl).ServeHTTP(w, r)
 	})
 
