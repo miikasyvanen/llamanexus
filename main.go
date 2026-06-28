@@ -314,6 +314,24 @@ func isZeroKeepAlive(v interface{}) bool {
 	}
 }
 
+func waitForRouterReady(baseURL string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := rpcHTTPClient.Get(baseURL + "/models")
+		if err == nil {
+			resp.Body.Close()
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// llamaBaseURL is the single source of truth for llama-server's address.
+// Computed once from the --llamaport flag at startup and reused by every
+// handler that talks to llama-server, so changing the port only requires
+// changing this one value.
+//var llamaBaseURL string
+
 var rpcHTTPClient = &http.Client{
 	Timeout: 10 * time.Minute, // Tarpeeksi pitkä aika raskaalle RPC-ajolle
 	Transport: &http.Transport{
@@ -495,6 +513,8 @@ func getBinaryPath(name string) string {
 }
 
 func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
+	llamaBaseURL := fmt.Sprintf("http://localhost:%d", llamaport)
+
 	home, _ := os.UserHomeDir()
 	hfModelsDir := filepath.Join(home, ".cache", "huggingface", "hub")
 	_ = os.MkdirAll(hfModelsDir, 0755)
@@ -748,7 +768,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 		if len(chatReq.Messages) == 0 && isZeroKeepAlive(chatReq.KeepAlive) {
 			fmt.Printf("[UNLOAD] Unloading model via router: %s\n", chatReq.Model)
 			unloadBody, _ := json.Marshal(map[string]string{"model": chatReq.Model})
-			resp, err := rpcHTTPClient.Post("http://localhost:8080/models/unload", "application/json", bytes.NewBuffer(unloadBody))
+			resp, err := rpcHTTPClient.Post(llamaBaseURL+"/models/unload", "application/json", bytes.NewBuffer(unloadBody))
 			if err != nil {
 				fmt.Printf("[UNLOAD] error calling router unload: %v\n", err)
 			} else {
@@ -819,6 +839,10 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 								// edited preset file - the whole router process needs restarting.
 								if err := llamaServer.Restart(); err != nil {
 									fmt.Printf("[CTX] failed to restart llama-server after ctx-size change: %v\n", err)
+								} else {
+									// Give the router a moment to come back up before this same request
+									// continues on to the actual chat completion call below.
+									waitForRouterReady(llamaBaseURL, 4*time.Second)
 								}
 								ctxTracker.Record(resolvedModel, requestedCtx)
 							}
@@ -842,7 +866,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 
 		// --- STATE 1: NON-STREAMED REQUEST (Follow-up questions) ---
 		if !chatReq.Stream {
-			resp, err := rpcHTTPClient.Post("http://localhost:8080/v1/chat/completions", "application/json", bytes.NewBuffer(backendJSON))
+			resp, err := rpcHTTPClient.Post(llamaBaseURL+"/v1/chat/completions", "application/json", bytes.NewBuffer(backendJSON))
 			if err != nil {
 				fmt.Printf("Llama-server connection error ei-streamissa: %v\n", err)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -919,7 +943,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 			flusher.Flush()
 		}
 
-		req, _ := http.NewRequest("POST", "http://localhost:8080/v1/chat/completions", bytes.NewBuffer(backendJSON))
+		req, _ := http.NewRequest("POST", llamaBaseURL+"/v1/chat/completions", bytes.NewBuffer(backendJSON))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := rpcHTTPClient.Do(req)
 		if err != nil {
@@ -1092,7 +1116,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 			fmt.Printf("[UNLOAD] /ollama/api/generate unload signal for model: %s\n", genReq.Model)
 
 			unloadBody, _ := json.Marshal(map[string]string{"model": genReq.Model})
-			resp, err := rpcHTTPClient.Post("http://localhost:8080/models/unload", "application/json", bytes.NewBuffer(unloadBody))
+			resp, err := rpcHTTPClient.Post(llamaBaseURL+"/models/unload", "application/json", bytes.NewBuffer(unloadBody))
 			w.Header().Set("Content-Type", "application/json")
 			if err != nil {
 				fmt.Printf("[UNLOAD] error forwarding to llama-server router: %v\n", err)
@@ -1120,7 +1144,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		r.URL.Path = "/completion"
 		r.Host = "localhost:8080"
-		originUrl, _ := url.Parse("http://localhost:8080")
+		originUrl, _ := url.Parse(llamaBaseURL)
 		httputil.NewSingleHostReverseProxy(originUrl).ServeHTTP(w, r)
 	})
 
@@ -1136,7 +1160,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 	http.HandleFunc("/openai/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path = "/v1/chat/completions"
 		r.Host = "localhost:8080"
-		originUrl, _ := url.Parse("http://localhost:8080")
+		originUrl, _ := url.Parse(llamaBaseURL)
 		httputil.NewSingleHostReverseProxy(originUrl).ServeHTTP(w, r)
 	})
 
@@ -1148,7 +1172,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 	http.HandleFunc("/ollama/api/ps", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		resp, err := rpcHTTPClient.Get("http://localhost:8080/models")
+		resp, err := rpcHTTPClient.Get(llamaBaseURL + "/models")
 		if err != nil {
 			// llama-server router unreachable - report no running models rather than erroring,
 			// matching Ollama's behavior of an empty list when nothing is loaded.
