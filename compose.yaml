@@ -1,0 +1,24 @@
+services:
+  llamanexus:
+    container_name: llamanexus
+    image: makershop/llamanexus:beta
+    pull_policy: always
+    tty: true
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./models:/root/.cache/huggingface
+      - ./config:/root/.config/huggingface
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HF_HUB_DISABLE_PROGRESS_BARS=0
+      - TQDM_DISABLE=0
+      - HF_TOKEN=${HF_TOKEN}
+    command: serve --port 11434 --llamaport 8080 -v # -- --ctx-size 16384 # use double dash to separate arguments to pass to llama-server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

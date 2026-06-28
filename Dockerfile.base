@@ -1,0 +1,26 @@
+# Base image with Llama.cpp and Nvidia CUDA
+# docker build -f Dockerfile.base -t llamanexus.base:latest .
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04 AS build-base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    git build-essential cmake curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Tuodaan virallinen Go-kääntäjä pohjaan valmiiksi
+COPY --from=golang:1.23 /usr/local/go /usr/local/go
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+WORKDIR /app
+
+# Haetaan ja käännetään llama.cpp CUDA + RPC -tuella valmiiksi talteen
+RUN git clone https://github.com/ggml-org/llama.cpp.git \
+    && cd llama.cpp \
+    && mkdir build \
+    && cd build \
+    && cmake .. \
+        -DGGML_CUDA=ON \
+        -DGGML_RPC=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+    && cmake --build . --config Release -j$(nproc)

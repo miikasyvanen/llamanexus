@@ -1,0 +1,16 @@
+services:
+  llamanexus-worker:
+    container_name: llamanexus-worker
+    image: makershop/llamanexus:beta
+    pull_policy: always
+    tty: true
+    ports:
+      - "50052:50052"
+    command: worker -v # -- --ctx-size 16384 # use double dash to separate arguments to pass to llama-server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
