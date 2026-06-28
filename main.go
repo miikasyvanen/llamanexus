@@ -814,17 +814,12 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 								// Don't update the tracker or trigger an unload if the write failed -
 								// we'd otherwise think the change took effect when it didn't.
 							} else {
-								unloadBody, _ := json.Marshal(map[string]string{"model": resolvedModel})
-								resp, err := rpcHTTPClient.Post("http://localhost:8080/models/unload", "application/json", bytes.NewBuffer(unloadBody))
-								if err != nil {
-									fmt.Printf("[CTX] failed to unload %s after ctx-size change: %v\n", resolvedModel, err)
-								} else {
-									resp.Body.Close()
+								// The router only parses --models-preset once at its own startup,
+								// so a per-model unload/reload alone won't pick up a freshly
+								// edited preset file - the whole router process needs restarting.
+								if err := llamaServer.Restart(); err != nil {
+									fmt.Printf("[CTX] failed to restart llama-server after ctx-size change: %v\n", err)
 								}
-								// Record the change regardless of whether the model was actually
-								// loaded at the time (unload on an already-unloaded model is a
-								// harmless no-op) - the preset write succeeded, so the NEXT load
-								// will pick up the new value either way.
 								ctxTracker.Record(resolvedModel, requestedCtx)
 							}
 						}
