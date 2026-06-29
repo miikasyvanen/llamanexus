@@ -137,10 +137,6 @@ type ModelPresetManager struct {
 	path string
 }
 
-func NewModelPresetManager(path string) *ModelPresetManager {
-	return &ModelPresetManager{path: path}
-}
-
 // PullProgress is reported during a model download via downloadModel's
 // callback, letting callers (HTTP handler, CLI) render it however they like.
 type PullProgress struct {
@@ -150,6 +146,63 @@ type PullProgress struct {
 	Total     int64
 	Done      bool
 	Error     error
+}
+
+func main() {
+	portFlag := flag.IntP("port", "", 0, "Määritä API/RPC portti")
+	llamaPortFlag := flag.IntP("llamaport", "", 8080, "Määritä Llama.cpp API portti")
+	modelFlag := flag.StringP("model", "m", DefaultModel, "Käytettävä GGUF-malli")
+	verboseFlag := flag.BoolP("verbose", "v", false, "Verbose-tila")
+
+	flag.Parse()
+
+	fmt.Printf("[INFO] Käynnistetään LlamaNexus version %s\n", Version)
+
+	port := *portFlag
+	llamaport := *llamaPortFlag
+	verbose := *verboseFlag
+	model := *modelFlag
+
+	args := flag.Args()
+	command := ""
+	if len(args) > 0 {
+		command = args[0]
+	} else {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if port == 0 {
+		if command == "worker" {
+			port = 50052
+		} else {
+			port = 11434
+		}
+	}
+
+	if command == "serve" {
+		fmt.Printf("[SERVE] Käynnistetään llama-server: port=%d llama port=%d verbose=%t\n", port, llamaport, verbose)
+		runServe(port, llamaport, verbose, args[1:])
+	} else if command == "run" {
+		fmt.Printf("[RUN] Käynnistetään llama-cli: model=%s verbose=%t\n", model, verbose)
+		runCliInference(model, verbose, args[1:])
+	} else if command == "pull" {
+		if len(args) < 2 {
+			fmt.Println("[ERROR] usage: llamanexus pull <repo:tag>")
+			os.Exit(1)
+		}
+		runPull(args[1], verbose)
+	} else if command == "worker" {
+		fmt.Printf("[WORKER] Käynnistetään worker: port=%d\n", port)
+		runRpcServer(port)
+	} else {
+		flag.Usage()
+		os.Exit(1)
+	}
+}
+
+func NewModelPresetManager(path string) *ModelPresetManager {
+	return &ModelPresetManager{path: path}
 }
 
 // LoadCtxSizes reads the preset file (if it exists) and returns a map of
@@ -446,61 +499,6 @@ var rpcHTTPClient = &http.Client{
 		ResponseHeaderTimeout: 5 * time.Minute,
 		IdleConnTimeout:       30 * time.Second,
 	},
-}
-
-func main() {
-	portFlag := flag.IntP("port", "", 0, "Määritä API/RPC portti")
-	llamaPortFlag := flag.IntP("llamaport", "", 8080, "Määritä Llama.cpp API portti")
-	modelFlag := flag.StringP("model", "m", DefaultModel, "Käytettävä GGUF-malli")
-	verboseFlag := flag.BoolP("verbose", "v", false, "Verbose-tila")
-
-	flag.Parse()
-
-	port := *portFlag
-	llamaport := *llamaPortFlag
-	verbose := *verboseFlag
-	model := *modelFlag
-
-	args := flag.Args()
-	command := ""
-	if len(args) > 0 {
-		command = args[0]
-	} else {
-		flag.Usage()
-		os.Exit(1)
-	}
-	fmt.Printf("Command line args:\n")
-	for i := range args {
-		fmt.Printf("arg %d: %s\n", i, args[i])
-	}
-
-	if port == 0 {
-		if command == "worker" {
-			port = 50052
-		} else {
-			port = 11434
-		}
-	}
-
-	if command == "serve" {
-		fmt.Printf("[SERVE] Käynnistetään llama-server: port=%d llama port=%d verbose=%t\n", port, llamaport, verbose)
-		runServe(port, llamaport, verbose, args[1:])
-	} else if command == "run" {
-		fmt.Printf("[RUN] Käynnistetään llama-cli: model=%s verbose=%t\n", model, verbose)
-		runCliInference(model, verbose, args[1:])
-	} else if command == "pull" {
-		if len(args) < 2 {
-			fmt.Println("[ERROR] usage: llamanexus pull <repo:tag>")
-			os.Exit(1)
-		}
-		runPull(args[1], verbose)
-	} else if command == "worker" {
-		fmt.Printf("[WORKER] Käynnistetään worker: port=%d\n", port)
-		runRpcServer(port)
-	} else {
-		flag.Usage()
-		os.Exit(1)
-	}
 }
 
 func resolveRealModelFile(requestedModel string) string {
