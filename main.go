@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -82,6 +83,7 @@ type OllamaModelInfo struct {
 	Size       int64                  `json:"size"`
 	Digest     string                 `json:"digest"`
 	Details    map[string]interface{} `json:"details"`
+	RealPath   string                 `json:"-"` // internal only - not serialized to JSON
 }
 
 type OpenAIModelsResponse struct {
@@ -137,6 +139,17 @@ type ModelPresetManager struct {
 
 func NewModelPresetManager(path string) *ModelPresetManager {
 	return &ModelPresetManager{path: path}
+}
+
+// PullProgress is reported during a model download via downloadModel's
+// callback, letting callers (HTTP handler, CLI) render it however they like.
+type PullProgress struct {
+	Status    string
+	Digest    string
+	Completed int64
+	Total     int64
+	Done      bool
+	Error     error
 }
 
 // LoadCtxSizes reads the preset file (if it exists) and returns a map of
@@ -308,6 +321,125 @@ func waitForRouterReady(baseURL string, timeout time.Duration) {
 	}
 }
 
+// downloadModel runs the Python sidecar to download a model from Hugging Face,
+// reporting progress via onProgress as it goes, and cleaning up any stray
+// .incomplete blob if ctx is cancelled or the download fails. It has no
+// knowledge of HTTP - both the /ollama/api/pull handler and the standalone
+// "pull" CLI command call this and handle PullProgress their own way.
+func downloadModel(ctx context.Context, repo string, fileName string, onProgress func(PullProgress)) error {
+	downloadCmd := exec.Command("python3", "/app/hf_progress_download.py", repo, fileName)
+	downloadCmd.Env = append(os.Environ(), "HF_HUB_DISABLE_XET=1")
+
+	stdout, err := downloadCmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	downloadCmd.Stderr = os.Stderr
+	if err := downloadCmd.Start(); err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	var lastTotal int64 = 0
+	var realDigest string = ""
+	sentAnyProgress := false
+
+	cleanupIncompleteBlobs := func(digest string) {
+		if digest == "" {
+			return
+		}
+		blobHash := strings.TrimPrefix(digest, "sha256:")
+		home, _ := os.UserHomeDir()
+		pattern := filepath.Join(home, ".cache", "huggingface", "hub", "models--*", "blobs", blobHash+".*.incomplete")
+		matches, _ := filepath.Glob(pattern)
+		for _, m := range matches {
+			if rmErr := os.Remove(m); rmErr == nil {
+				fmt.Printf("[CLEANUP] removed stale incomplete blob: %s\n", m)
+			}
+		}
+	}
+
+	lineCh := make(chan string)
+	go func() {
+		for scanner.Scan() {
+			lineCh <- scanner.Text()
+		}
+		close(lineCh)
+	}()
+
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			_ = downloadCmd.Process.Kill()
+			_, _ = downloadCmd.Process.Wait()
+			cleanupIncompleteBlobs(realDigest)
+			return ctx.Err()
+
+		case line, chOk := <-lineCh:
+			if !chOk {
+				break loop
+			}
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			var prog struct {
+				Status    string `json:"status"`
+				Digest    string `json:"digest"`
+				Completed int64  `json:"completed"`
+				Total     int64  `json:"total"`
+				Done      bool   `json:"done"`
+				Path      string `json:"path"`
+			}
+			if err := json.Unmarshal([]byte(line), &prog); err != nil {
+				continue
+			}
+
+			if prog.Digest != "" {
+				realDigest = prog.Digest
+			}
+
+			if prog.Status == "pulling manifest" {
+				onProgress(PullProgress{Status: "pulling manifest"})
+				continue
+			}
+
+			if prog.Done {
+				break loop
+			}
+
+			if prog.Total > 0 {
+				lastTotal = prog.Total
+			}
+			if lastTotal == 0 {
+				continue
+			}
+			if prog.Completed == 0 && !sentAnyProgress {
+				continue
+			}
+			sentAnyProgress = true
+
+			onProgress(PullProgress{
+				Status:    "pulling",
+				Digest:    realDigest,
+				Completed: prog.Completed,
+				Total:     lastTotal,
+			})
+		}
+	}
+
+	if err := downloadCmd.Wait(); err != nil {
+		cleanupIncompleteBlobs(realDigest)
+		onProgress(PullProgress{Error: err, Done: true})
+		return err
+	}
+
+	onProgress(PullProgress{Status: "success", Done: true})
+	return nil
+}
+
 var rpcHTTPClient = &http.Client{
 	Timeout: 10 * time.Minute, // Tarpeeksi pitkä aika raskaalle RPC-ajolle
 	Transport: &http.Transport{
@@ -321,24 +453,20 @@ func main() {
 	llamaPortFlag := flag.IntP("llamaport", "", 8080, "Määritä Llama.cpp API portti")
 	modelFlag := flag.StringP("model", "m", DefaultModel, "Käytettävä GGUF-malli")
 	verboseFlag := flag.BoolP("verbose", "v", false, "Verbose-tila")
-	//ctxFlag := flag.IntP("ctx-size", "c", 4096, "Kontekstin koko")
 
 	flag.Parse()
-
-	fmt.Println("proxy port:", *portFlag)
-	fmt.Println("llama port:", *llamaPortFlag)
 
 	port := *portFlag
 	llamaport := *llamaPortFlag
 	verbose := *verboseFlag
 	model := *modelFlag
-	//ctx := *ctxFlag
 
 	args := flag.Args()
 	command := ""
 	if len(args) > 0 {
 		command = args[0]
 	} else {
+		flag.Usage()
 		os.Exit(1)
 	}
 	fmt.Printf("Command line args:\n")
@@ -360,6 +488,12 @@ func main() {
 	} else if command == "run" {
 		fmt.Printf("[RUN] Käynnistetään llama-cli: model=%s verbose=%t\n", model, verbose)
 		runCliInference(model, verbose, args[1:])
+	} else if command == "pull" {
+		if len(args) < 2 {
+			fmt.Println("[ERROR] usage: llamanexus pull <repo:tag>")
+			os.Exit(1)
+		}
+		runPull(args[1], verbose)
 	} else if command == "worker" {
 		fmt.Printf("[WORKER] Käynnistetään worker: port=%d\n", port)
 		runRpcServer(port)
@@ -374,44 +508,18 @@ func resolveRealModelFile(requestedModel string) string {
 	return strings.TrimSuffix(clean, ":latest")
 }
 
-func findModelInHFCache(modelName string, cacheDir string) string {
-	var foundPath string
-	_ = filepath.Walk(cacheDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
+// resolveModelPath finds the real GGUF file path for a given repo:tag model
+// identifier by reusing ScanHFCacheModels, so CLI inference and server mode
+// agree on how models are located in the cache.
+func resolveModelPath(modelName string, cacheDir string) (string, error) {
+	models := ScanHFCacheModels(cacheDir)
+	cleanName := resolveRealModelFile(modelName)
+	for _, m := range models {
+		if m.Name == cleanName {
+			return m.RealPath, nil
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			realPath, err := os.Readlink(path)
-			if err == nil {
-				if !filepath.IsAbs(realPath) {
-					realPath = filepath.Join(filepath.Dir(path), realPath)
-				}
-				realInfo, err := os.Stat(realPath)
-				if err == nil && realInfo.Size() > 100*1024*1024 && strings.Contains(path, modelName) {
-					foundPath = realPath
-					return filepath.SkipDir
-				}
-			}
-		}
-		if !info.IsDir() && info.Size() > 100*1024*1024 {
-			if strings.Contains(path, "blobs") {
-				foundPath = path
-				return filepath.SkipDir
-			}
-		}
-		return nil
-	})
-	return foundPath
-}
-
-func ensureModel(modelName string, verbose bool) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		os.Exit(1)
 	}
-	hfCacheDir := filepath.Join(home, ".cache", "huggingface", "hub")
-	_ = os.MkdirAll(hfCacheDir, 0755)
-	return findModelInHFCache(modelName, hfCacheDir)
+	return "", fmt.Errorf("model %q not found in cache", modelName)
 }
 
 func ScanHFCacheModels(cacheDir string) []OllamaModelInfo {
@@ -462,9 +570,11 @@ func ScanHFCacheModels(cacheDir string) []OllamaModelInfo {
 					}
 
 					fullIdentifier1 := fmt.Sprintf("%s:%s", repoID, tag)
+					realPath := filepath.Join(snapshotDir, fileName)
 					foundModels = append(foundModels, OllamaModelInfo{
 						Name: fullIdentifier1, Model: fullIdentifier1, ModifiedAt: info.ModTime(), Size: info.Size(),
 						Digest: fmt.Sprintf("sha256-%d", info.Size()), Details: map[string]interface{}{"format": "gguf", "family": "llama"},
+						RealPath: realPath,
 					})
 				}
 			}
@@ -547,8 +657,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 		w.Header().Set("Connection", "keep-alive")
 		flusher, ok := w.(http.Flusher)
 
-		rawModel := pullReq.Model
-		rawModel = strings.TrimSuffix(rawModel, ":latest")
+		rawModel := strings.TrimSuffix(pullReq.Model, ":latest")
 		parts := strings.Split(rawModel, ":")
 		if len(parts) < 2 {
 			return
@@ -558,166 +667,51 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 			fileName += ".gguf"
 		}
 
-		downloadCmd := exec.Command("python3", "/app/hf_progress_download.py", repo, fileName)
-		downloadCmd.Env = append(os.Environ(), "HF_HUB_DISABLE_XET=1")
-
-		stdout, err := downloadCmd.StdoutPipe()
-		if err != nil {
-			return
-		}
-		downloadCmd.Stderr = os.Stderr
-		if err := downloadCmd.Start(); err != nil {
-			return
-		}
-
-		scanner := bufio.NewScanner(stdout)
-		ctx := r.Context()
-
-		var lastTotal int64 = 0
-		var realDigest string = ""
-		sentAnyProgress := false
-
-		// cleanupIncompleteBlobs removes any stray .incomplete temp files for the
-		// given digest, working around a known huggingface_hub bug where killed/
-		// failed downloads leave randomly-named partial blobs that are never
-		// resumed or cleaned up (huggingface/huggingface_hub#4196).
-		cleanupIncompleteBlobs := func(digest string) {
-			if digest == "" {
-				return
-			}
-			blobHash := strings.TrimPrefix(digest, "sha256:")
-			home, _ := os.UserHomeDir()
-			pattern := filepath.Join(home, ".cache", "huggingface", "hub", "models--*", "blobs", blobHash+".*.incomplete")
-			matches, _ := filepath.Glob(pattern)
-			for _, m := range matches {
-				if rmErr := os.Remove(m); rmErr == nil {
-					fmt.Printf("[CLEANUP] removed stale incomplete blob: %s\n", m)
-				}
-			}
-		}
-
-		// Run the scanner in its own goroutine so we can select between new lines
-		// and context cancellation (bufio.Scanner.Scan() can't be interrupted directly).
-		lineCh := make(chan string)
-		go func() {
-			for scanner.Scan() {
-				lineCh <- scanner.Text()
-			}
-			close(lineCh)
-		}()
-
-	loop:
-		for {
-			select {
-			case <-ctx.Done():
-				// Client disconnected or cancelled the pull - kill the subprocess
-				// and clean up its partial blob before returning.
-				_ = downloadCmd.Process.Kill()
-				_, _ = downloadCmd.Process.Wait() // reap the process, avoid zombie
-				cleanupIncompleteBlobs(realDigest)
-				return
-
-			case line, chOk := <-lineCh:
-				if !chOk {
-					break loop // scanner finished (EOF or read error)
-				}
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-
-				var prog struct {
-					Status    string `json:"status"`
-					Digest    string `json:"digest"`
-					Completed int64  `json:"completed"`
-					Total     int64  `json:"total"`
-					Done      bool   `json:"done"`
-					Path      string `json:"path"`
-				}
-				if err := json.Unmarshal([]byte(line), &prog); err != nil {
-					continue
-				}
-
-				if prog.Digest != "" {
-					realDigest = prog.Digest
-				}
-
-				if prog.Status == "pulling manifest" {
-					manifestResp, _ := json.Marshal(map[string]interface{}{
-						"status": "pulling manifest",
-					})
-					_, _ = w.Write(manifestResp)
-					_, _ = w.Write([]byte("\n"))
-					if ok {
-						flusher.Flush()
-					}
-					continue
-				}
-
-				if prog.Done {
-					break loop
-				}
-
-				if prog.Total > 0 {
-					lastTotal = prog.Total
-				}
-				if lastTotal == 0 {
-					continue
-				}
-
-				// Hold back the first visible update until we see real movement,
-				// avoiding a 0%/100% flash before tqdm reports genuine progress.
-				if prog.Completed == 0 && !sentAnyProgress {
-					continue
-				}
-				sentAnyProgress = true
-
-				digestForStatus := realDigest
-				if digestForStatus == "" {
-					digestForStatus = "sha256:" + strings.Repeat("0", 64)
-				}
-				statusDigest := strings.TrimPrefix(digestForStatus, "sha256:")
-				if len(statusDigest) > 12 {
-					statusDigest = statusDigest[:12]
-				}
-
-				progResp, _ := json.Marshal(map[string]interface{}{
-					"status":    fmt.Sprintf("pulling %s", statusDigest),
-					"digest":    digestForStatus,
-					"completed": prog.Completed,
-					"total":     lastTotal,
-				})
-				_, _ = w.Write(progResp)
-				_, _ = w.Write([]byte("\n"))
-				if ok {
-					flusher.Flush()
-				}
-			}
-		}
-
-		if err := downloadCmd.Wait(); err != nil {
-			// Download failed (not user-cancelled, since that returns earlier) -
-			// clean up any partial blob left behind here too.
-			cleanupIncompleteBlobs(realDigest)
-			errResp, _ := json.Marshal(map[string]interface{}{"status": "error", "error": err.Error()})
-			_, _ = w.Write(errResp)
+		writeLine := func(v interface{}) {
+			out, _ := json.Marshal(v)
+			_, _ = w.Write(out)
 			_, _ = w.Write([]byte("\n"))
 			if ok {
 				flusher.Flush()
 			}
-			return
 		}
 
-		successResp, _ := json.Marshal(map[string]interface{}{"status": "success", "done": true})
-		_, _ = w.Write(successResp)
-		_, _ = w.Write([]byte("\n"))
-		if ok {
-			flusher.Flush()
+		err := downloadModel(r.Context(), repo, fileName, func(p PullProgress) {
+			if p.Status == "pulling manifest" {
+				writeLine(map[string]interface{}{"status": "pulling manifest"})
+				return
+			}
+			if p.Error != nil {
+				writeLine(map[string]interface{}{"status": "error", "error": p.Error.Error()})
+				return
+			}
+			if p.Done {
+				writeLine(map[string]interface{}{"status": "success", "done": true})
+				return
+			}
+
+			digestForStatus := p.Digest
+			if digestForStatus == "" {
+				digestForStatus = "sha256:" + strings.Repeat("0", 64)
+			}
+			statusDigest := strings.TrimPrefix(digestForStatus, "sha256:")
+			if len(statusDigest) > 12 {
+				statusDigest = statusDigest[:12]
+			}
+			writeLine(map[string]interface{}{
+				"status":    fmt.Sprintf("pulling %s", statusDigest),
+				"digest":    digestForStatus,
+				"completed": p.Completed,
+				"total":     p.Total,
+			})
+		})
+
+		if err != nil {
+			return // error already written via onProgress before downloadModel returned
 		}
 
-		// llama-server only scans --models-dir once at its own startup, so restart
-		// it to pick up the newly downloaded model without requiring a full
-		// container restart.
+		// llama-server only scans --models-dir/--models-preset once at its own
+		// startup, so restart it to pick up the newly downloaded model.
 		if err := llamaServer.Restart(); err != nil {
 			fmt.Println("[ERROR] Failed to restart llama-server after pull:", err)
 		}
@@ -1212,15 +1206,107 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 	_ = http.ListenAndServe(fmt.Sprintf(":%d", port), nil)
 }
 
+func runPull(modelName string, verbose bool) {
+	rawModel := strings.TrimSuffix(modelName, ":latest")
+	parts := strings.Split(rawModel, ":")
+	if len(parts) < 2 {
+		fmt.Println("[ERROR] model must be specified as repo:tag, e.g. Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M")
+		os.Exit(1)
+	}
+	repo, fileName := parts[0], parts[1]
+	if !strings.HasSuffix(strings.ToLower(fileName), ".gguf") {
+		fileName += ".gguf"
+	}
+
+	fmt.Printf("[PULL] Downloading %s...\n", modelName)
+
+	err := downloadModel(context.Background(), repo, fileName, func(p PullProgress) {
+		switch {
+		case p.Error != nil:
+			fmt.Println("[PULL] error:", p.Error)
+		case p.Status == "pulling manifest":
+			fmt.Println("[PULL] resolving manifest...")
+		case p.Done:
+			fmt.Println("[PULL] done.")
+		case p.Total > 0:
+			pct := float64(p.Completed) / float64(p.Total) * 100
+			fmt.Printf("\r[PULL] %.1f%% (%d / %d bytes)", pct, p.Completed, p.Total)
+		}
+	})
+
+	fmt.Println()
+	if err != nil {
+		fmt.Println("[ERROR] pull failed:", err)
+		os.Exit(1)
+	}
+}
+
+// resolveModelPathByRepo is a fallback for when the user's original model
+// string (e.g. an exact filename) doesn't match ScanHFCacheModels' inferred
+// short-tag identifier. It matches on repo name alone and returns the most
+// recently modified file for that repo - a reasonable choice immediately
+// after a fresh download, since that's the file that was just written.
+func resolveModelPathByRepo(modelName string, cacheDir string) (string, error) {
+	repo := strings.SplitN(resolveRealModelFile(modelName), ":", 2)[0]
+	models := ScanHFCacheModels(cacheDir)
+
+	var best OllamaModelInfo
+	found := false
+	for _, m := range models {
+		modelRepo := strings.SplitN(m.Name, ":", 2)[0]
+		if modelRepo == repo && (!found || m.ModifiedAt.After(best.ModifiedAt)) {
+			best = m
+			found = true
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("no cached model found for repo %q", repo)
+	}
+	return best.RealPath, nil
+}
+
 func runCliInference(model string, verbose bool, promptArgs []string) {
-	modelPath := ensureModel(model, verbose)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Println("[ERROR] could not determine home directory:", err)
+		os.Exit(1)
+	}
+	hfCacheDir := filepath.Join(home, ".cache", "huggingface", "hub")
+
+	modelPath, err := resolveModelPath(model, hfCacheDir)
+	if err != nil {
+		fmt.Printf("[RUN] model %s not found in cache, downloading...\n", model)
+		runPull(model, verbose)
+
+		// After downloading, re-scan rather than trust the original input string -
+		// the user may have typed a full filename or a short quant tag, and
+		// ScanHFCacheModels always normalizes to its own short-tag scheme.
+		// Match on repo alone if the exact string still doesn't resolve.
+		modelPath, err = resolveModelPath(model, hfCacheDir)
+		if err != nil {
+			modelPath, err = resolveModelPathByRepo(model, hfCacheDir)
+		}
+		if err != nil {
+			fmt.Println("[ERROR] model still not found after pull:", err)
+			os.Exit(1)
+		}
+	}
+
+	if verbose {
+		fmt.Printf("[DEBUG] Resolved model %s to path %s\n", model, modelPath)
+	}
+
 	cliBin := getBinaryPath("llama-cli")
-	args := []string{"-m", modelPath}
-	args = append(args, strings.Join(promptArgs, " "))
+	args := []string{"-m", modelPath, "-st"}
+	args = append(args, promptArgs...)
+
 	cmd := exec.Command(cliBin, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	_ = cmd.Run()
+	if err := cmd.Run(); err != nil {
+		fmt.Println("[ERROR] llama-cli exited with error:", err)
+		os.Exit(1)
+	}
 }
 
 func runRpcServer(port int) {
