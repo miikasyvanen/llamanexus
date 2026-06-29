@@ -1,4 +1,4 @@
-module llamanexus
+module llama-nexus
 
 go 1.21
 

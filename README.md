@@ -68,6 +68,31 @@ Starts a `rpc-server` instance for distributed/multi-machine inference via llama
 llamanexus worker --port 50052
 ```
 
+## Build from source
+
+### Docker
+
+Repository contains three Dockerfiles. Dockerfile.base and Dockerfile are used together. Dockerfile.base builds Llama.cpp with CUDA support base image and Dockerfile builds LlamaNexus and then these two images are combined to one that can be used with docker / docker-compose. Dockerfile.full builds all in one run. Two step build is only to prevent llama.cpp/CUDA to rebuilt in any case to save time.
+
+### Build with base
+
+```bash
+docker build --file Dockerfile.base -t llamanexus:base .
+docker build -t llamanexus:beta .
+```
+
+### Build full
+
+```bash
+docker build --file Dockerfile.full -t llamanexus:beta .
+```
+
+When building and using local images, two lines needs to be changed in docker-compose.yml
+```bash
+    image: llamanexus:beta
+    pull_policy: never
+```
+
 ## Setup
 
 LlamaNexus is designed to run in Docker alongside `llama-server` (CUDA-enabled) and Open WebUI. See `compose.yaml` / `docker-compose-server.yml` for the reference setup.
