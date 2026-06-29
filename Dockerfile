@@ -1,10 +1,11 @@
-# docker-compose build
-# --- Vaihe 1: Käännetään VAIN Go-sovellus hyödyntäen esikäännettyä pohjaa ---
+# docker build -t makershop/llamanexus:beta .
+#
+# --- Build only LlamaNexus using llamanexus:base as builder ---
 FROM llamanexus:base AS builder
 
 WORKDIR /app
 
-# Kopioidaan Go-riippuvuudet ja lähdekoodi (käännetään vain jos ne muuttuvat)
+# Copy dependencies and source code (build only if changed)
 COPY go.mod /app/
 COPY main.go /app/main.go
 COPY hf_progress_download.py /app/hf_progress_download.py
@@ -18,7 +19,7 @@ RUN go get gopkg.in/ini.v1
 # Build llama-nexus software
 RUN go build -o llamanexus main.go
 
-# --- Vaihe 2: Minimaalinen ajokontti (Pysyy samana) ---
+# --- Minimal container ---
 FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
 RUN apt-get update && apt-get install -y \
@@ -28,7 +29,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Kopioidaan valmiit binäärit esikäännetystä pohjasta sekä uusi Go-binääri
+# Copy built binaries from the builder stage and the new Go binary
 COPY --from=builder /app/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=builder /app/llama.cpp/build/bin/llama-cli /usr/local/bin/llama-cli
 COPY --from=builder /app/llama.cpp/build/bin/rpc-server /usr/local/bin/rpc-server
@@ -36,7 +37,6 @@ COPY --from=builder /app/llamanexus /app/llamanexus
 COPY --from=builder /app/hf_progress_download.py /app/hf_progress_download.py
 
 ENV HOME=/root
-#RUN mkdir -p /root/models
 
 ENTRYPOINT ["/app/llamanexus"]
 CMD ["serve"]
