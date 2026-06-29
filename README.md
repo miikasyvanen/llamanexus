@@ -31,12 +31,12 @@ Open WebUI  --(Ollama / OpenAI API)-->  LlamaNexus  --(OpenAI-compatible API)-->
 Starts the proxy and the underlying `llama-server` router. This is the main mode, used in production via Docker Compose alongside Open WebUI.
 
 ```bash
-llamanexus serve --llamaport 8080 --port 11434 [llama-server args...]
+llamanexus serve --llamaport 8080 --port 11434 -- [llama-server args...]
 ```
 
 - `--port` — port LlamaNexus itself listens on (default `11434`, matching Ollama's default).
 - `--llamaport` — port `llama-server`'s router listens on internally (default `8080`).
-- Any arguments after the subcommand are passed straight through to `llama-server` (e.g. `--n-gpu-layers`, `-ngl`, etc.) — but **not** `--ctx-size`, since that conflicts with the per-model preset mechanism (see [Context size overrides](#context-size-overrides) below).
+- Any arguments after the `--` are passed straight through to `llama-server` (e.g. `--n-gpu-layers`, `-ngl`, etc.) — but **not** `--ctx-size`, since that conflicts with the per-model preset mechanism (see [Context size overrides](#context-size-overrides) below).
 
 ### `run`
 
@@ -72,7 +72,7 @@ llamanexus worker --port 50052
 
 ### Docker
 
-Repository contains three Dockerfiles. Dockerfile.base and Dockerfile are used together. Dockerfile.base builds Llama.cpp with CUDA support base image and Dockerfile builds LlamaNexus and then these two images are combined to one that can be used with docker / docker-compose. Dockerfile.full builds all in one run. Two step build is only to prevent llama.cpp/CUDA to rebuilt in any case to save time.
+Repository contains three Dockerfiles. Dockerfile.base and Dockerfile are used together. Dockerfile.base builds Llama.cpp with CUDA support base image and Dockerfile builds LlamaNexus and combines these two images to one that can be used with docker / docker-compose. Dockerfile.full builds all in one run. Two step build is only to prevent llama.cpp/CUDA to rebuilt in any case to save time.
 
 ### Build with base
 
@@ -84,7 +84,7 @@ docker build -t llamanexus:beta .
 ### Build full
 
 ```bash
-docker build --file Dockerfile.full -t llamanexus:beta .
+docker build --file Dockerfile.full -t llamanexus:full .
 ```
 
 When building and using local images, two lines needs to be changed in docker-compose.yml
