@@ -138,3 +138,14 @@ Open WebUI's "eject" action and Ollama's `keep_alive: 0` convention are both sup
 - **Cancelled or failed downloads** can leave orphaned `.incomplete` blob files in the Hugging Face cache due to a known upstream bug ([huggingface/huggingface_hub#4196](https://github.com/huggingface/huggingface_hub/issues/4196)) where resume doesn't work across separate download attempts. LlamaNexus cleans these up automatically on cancellation or failure.
 - **Open WebUI's green "loaded" dot and eject button** may not render correctly in all Open WebUI versions due to upstream frontend bugs unrelated to LlamaNexus; LlamaNexus's `/ollama/api/ps` and unload handling are independently verified to work correctly via direct API calls regardless. **Open WebUI version 0.9.4 is tested to work, latest version 0.9.6 will not render correctly green "loaded" dot and eject button**
 
+## License
+
+You may copy, distribute and modify the software as long as you track changes/dates in source files. Any modifications to or software including (via compiler) GPL-licensed code must also be made available under the GPL along with build & install instructions.
+
+Commercial uses is possible, but all code linked with GPL 3.0 source code must be disclosed under a GPL 3.0 compatible license.
+
+## Support
+
+If you find LlamaNexus useful, please consider supporting me as this software is developed on my free time and will always be open source and free of charge. Donations will be used to aquire a lots of coffee :) that plays important role during development!
+
+https://www.paypal.com/paypalme/miikasyvanen
