@@ -149,17 +149,19 @@ type PullProgress struct {
 }
 
 func main() {
-	portFlag := flag.IntP("port", "", 0, "Määritä API/RPC portti")
-	llamaPortFlag := flag.IntP("llamaport", "", 8080, "Määritä Llama.cpp API portti")
-	modelFlag := flag.StringP("model", "m", DefaultModel, "Käytettävä GGUF-malli")
-	verboseFlag := flag.BoolP("verbose", "v", false, "Verbose-tila")
+	portFlag := flag.IntP("port", "", 11434, "Specify API/RPC port")
+	llamaPortFlag := flag.IntP("llama-port", "", 8080, "Specify Llama.cpp API port")
+	rpcPortFlag := flag.IntP("rpc-port", "", 50052, "Specify RPC port")
+	modelFlag := flag.StringP("model", "m", DefaultModel, "Specified GGUF model")
+	verboseFlag := flag.BoolP("verbose", "v", false, "Verbose mode")
 
 	flag.Parse()
 
-	fmt.Printf("[INFO] Käynnistetään LlamaNexus version %s\n", Version)
+	fmt.Printf("[INFO] Starting LlamaNexus version %s\n", Version)
 
 	port := *portFlag
 	llamaport := *llamaPortFlag
+	rpcport := *rpcPortFlag
 	verbose := *verboseFlag
 	model := *modelFlag
 
@@ -172,19 +174,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if port == 0 {
-		if command == "worker" {
-			port = 50052
-		} else {
-			port = 11434
-		}
-	}
-
 	if command == "serve" {
-		fmt.Printf("[SERVE] Käynnistetään llama-server: port=%d llama port=%d verbose=%t\n", port, llamaport, verbose)
+		fmt.Printf("[SERVE] Starting llama-server: port=%d llama port=%d verbose=%t\n", port, llamaport, verbose)
 		runServe(port, llamaport, verbose, args[1:])
 	} else if command == "run" {
-		fmt.Printf("[RUN] Käynnistetään llama-cli: model=%s verbose=%t\n", model, verbose)
+		fmt.Printf("[RUN] Starting llama-cli: model=%s verbose=%t\n", model, verbose)
 		runCliInference(model, verbose, args[1:])
 	} else if command == "pull" {
 		if len(args) < 2 {
@@ -193,8 +187,8 @@ func main() {
 		}
 		runPull(args[1], verbose)
 	} else if command == "worker" {
-		fmt.Printf("[WORKER] Käynnistetään worker: port=%d\n", port)
-		runRpcServer(port)
+		fmt.Printf("[WORKER] Starting worker: port=%d\n", rpcport)
+		runRpcServer(rpcport, args[1:])
 	} else {
 		flag.Usage()
 		os.Exit(1)
@@ -836,7 +830,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 		if !chatReq.Stream {
 			resp, err := rpcHTTPClient.Post(llamaBaseURL+"/v1/chat/completions", "application/json", bytes.NewBuffer(backendJSON))
 			if err != nil {
-				fmt.Printf("Llama-server connection error ei-streamissa: %v\n", err)
+				fmt.Printf("Llama-server connection error in non-streamed request: %v\n", err)
 				w.WriteHeader(http.StatusInternalServerError)
 				errOut, _ := json.Marshal(map[string]interface{}{"error": err.Error()})
 				_, _ = w.Write(errOut)
@@ -847,7 +841,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 			if resp.StatusCode != http.StatusOK {
 				var errResp map[string]interface{}
 				_ = json.NewDecoder(resp.Body).Decode(&errResp)
-				fmt.Printf("Llama-server palautti virheen ei-streamissa: %v", errResp)
+				fmt.Printf("Llama-server error in non-streamed request: %v", errResp)
 
 				w.WriteHeader(http.StatusInternalServerError)
 				errOut, _ := json.Marshal(map[string]interface{}{
@@ -915,7 +909,7 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := rpcHTTPClient.Do(req)
 		if err != nil {
-			fmt.Printf("Llama-server connection error streamissa: %v\n", err)
+			fmt.Printf("Llama-server connection error in streamed request: %v\n", err)
 			errOut, _ := json.Marshal(map[string]interface{}{
 				"model":      chatReq.Model,
 				"created_at": time.Now().UTC(),
@@ -1307,11 +1301,16 @@ func runCliInference(model string, verbose bool, promptArgs []string) {
 	}
 }
 
-func runRpcServer(port int) {
+func runRpcServer(port int, promptArgs []string) {
 	rpcBin := getBinaryPath("rpc-server")
-	cmd := exec.Command(rpcBin, "-p", strconv.Itoa(port))
+	args := []string{"-H", "0.0.0.0", "-p", strconv.Itoa(port)}
+	args = append(args, promptArgs...)
+	cmd := exec.Command(rpcBin, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	fmt.Printf("[WORKER] rpc-server aktiivinen portissa %d...\n", port)
-	_ = cmd.Run()
+	fmt.Printf("[WORKER] RPC-server active: port=%d...\n", port)
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("[WORKER] rpc-server exited: %v\n", err)
+		os.Exit(1)
+	}
 }

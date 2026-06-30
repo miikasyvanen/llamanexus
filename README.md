@@ -93,6 +93,35 @@ When building and using local images, two lines needs to be changed in docker-co
     pull_policy: never
 ```
 
+## CPU architecture compatibility
+
+By default, llama.cpp's CMake build detects the CPU features of the **build machine** and compiles for those — meaning a binary built on a modern CPU may crash with `signal: illegal instruction (SIGILL)` when deployed to an older one. This is especially relevant when running the `worker` (rpc-server) on a different machine than the primary server.
+
+LlamaNexus explicitly disables CPU-specific instruction sets in its Dockerfiles to produce a portable binary that works across machines:
+
+```dockerfile
+cmake .. \
+  -DGGML_NATIVE=OFF \   # Do not optimize for the build machine's CPU
+  -DGGML_AVX=ON \       # Safe baseline, present on most modern CPUs
+  -DGGML_AVX2=OFF \     # Disable — not available on all CPUs
+  -DGGML_FMA=OFF \      # Disable — often paired with AVX2
+  -DGGML_F16C=OFF \     # Disable — not universally available
+  -DGGML_BMI2=OFF \     # Disable — missing on older Intel/AMD CPUs
+  -DGGML_AVX512=OFF     # Disable — high-end CPUs only
+```
+
+> **Note:** GPU offload (CUDA) is unaffected by these CPU flags — the performance impact of disabling AVX2/FMA is minimal when inference is running on the GPU.
+
+### Diagnosing SIGILL on a worker machine
+
+If `rpc-server` crashes immediately after `ggml_cuda_init` with `signal: illegal instruction`, compare CPU flags between the build machine and the worker machine:
+
+```bash
+cat /proc/cpuinfo | grep -m1 flags | tr ' ' '\n' | grep -E 'avx|fma|bmi'
+```
+
+Any flag present on the build machine but missing on the worker is a potential SIGILL cause. The most common culprits are `avx2`, `fma`, and `bmi2`.
+
 ## Setup
 
 LlamaNexus is designed to run in Docker alongside `llama-server` (CUDA-enabled) and Open WebUI. See `compose.yaml` / `docker-compose-server.yml` for the reference setup.

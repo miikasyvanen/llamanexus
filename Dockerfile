@@ -16,7 +16,7 @@ RUN go get github.com/spf13/pflag
 # Install ini.v1 for configuration file parsing
 RUN go get gopkg.in/ini.v1
 
-# Build llama-nexus software
+# Build llamanexus software
 RUN go build -o llamanexus main.go
 
 # --- Minimal container ---
@@ -32,7 +32,7 @@ WORKDIR /app
 # Copy built binaries from the builder stage and the new Go binary
 COPY --from=builder /app/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=builder /app/llama.cpp/build/bin/llama-cli /usr/local/bin/llama-cli
-COPY --from=builder /app/llama.cpp/build/bin/rpc-server /usr/local/bin/rpc-server
+COPY --from=builder /app/llama.cpp/build/bin/ggml-rpc-server /usr/local/bin/rpc-server
 COPY --from=builder /app/llamanexus /app/llamanexus
 COPY --from=builder /app/hf_progress_download.py /app/hf_progress_download.py
 
