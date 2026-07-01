@@ -1,12 +1,12 @@
 services:
-  llamanexus-worker:
-    container_name: llamanexus-worker
+  llamanexus:
+    container_name: llamanexus
     image: makershop/llamanexus:beta
     pull_policy: always
     tty: true
     ports:
       - "50052:50052"
-    command: worker -v # -- --ctx-size 16384 # use double dash to separate arguments to pass to llama-server
+    command: worker -v
     deploy:
       resources:
         reservations:
