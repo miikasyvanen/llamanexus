@@ -8,7 +8,6 @@ services:
       - "11434:11434"
     volumes:
       - ./models:/root/.cache/huggingface
-      - ./config:/root/.config/huggingface
     environment:
       - PYTHONUNBUFFERED=1
       - HF_HUB_DISABLE_PROGRESS_BARS=0
