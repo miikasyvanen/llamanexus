@@ -6,7 +6,9 @@ It runs as a single Go binary (`llamanexus`) with four subcommands: `serve`, `ru
 
 ## Why this exists
 
-Open WebUI speaks the Ollama API natively. `llama-server` speaks an OpenAI-compatible API and runs in **router mode**, managing multiple GGUF models loaded from a local cache directory. LlamaNexus bridges the two: it presents an Ollama-compatible (and OpenAI-compatible) HTTP API to Open WebUI, and forwards requests to `llama-server`'s router underneath, translating request/response shapes as needed.
+The primary goal of LlamaNexus is to enable **distributed inference** across multiple machines using llama.cpp's [RPC backend](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc#overview). Worker machines run the same Docker image started with the `worker` command, exposing their GPU or CPU resources to the primary server via `ggml-rpc-server`. The primary server's RPC backend distributes model layer computations across all connected workers, allowing inference to scale beyond a single machine's memory and compute.
+
+Beyond distributed inference, LlamaNexus acts as a proxy between Open WebUI and `llama-server`. Open WebUI speaks the Ollama API natively, while `llama-server` speaks an OpenAI-compatible API and runs in **router mode**, managing multiple GGUF models loaded from a local cache directory. LlamaNexus bridges the two: it presents an Ollama-compatible (and OpenAI-compatible) HTTP API to Open WebUI and forwards requests to `llama-server`'s router underneath, translating request/response shapes as needed.
 
 It also takes over model downloading from Hugging Face Hub directly (rather than relying on `llama-server`'s own `--hf-repo` auto-pull), so that download progress can be reported back to Open WebUI's UI in real time.
 
@@ -62,7 +64,7 @@ Prints a live percentage as the download progresses, then exits.
 
 ### `worker`
 
-Starts a `rpc-server` instance for distributed/multi-machine inference via llama.cpp's RPC backend. Used in a separate Docker Compose file (`docker-compose-worker.yml`) on machines contributing compute to a primary `serve` instance.
+Starts a `ggml-rpc-server` instance for distributed/multi-machine inference via llama.cpp's RPC backend. Used in a separate Docker Compose file (`docker-compose-worker.yml`) on machines contributing compute to a primary `serve` instance.
 
 ```bash
 llamanexus worker --port 50052
@@ -95,7 +97,7 @@ When building and using local images, two lines needs to be changed in docker-co
 
 ## CPU architecture compatibility
 
-By default, llama.cpp's CMake build detects the CPU features of the **build machine** and compiles for those — meaning a binary built on a modern CPU may crash with `signal: illegal instruction (SIGILL)` when deployed to an older one. This is especially relevant when running the `worker` (rpc-server) on a different machine than the primary server.
+By default, llama.cpp's CMake build detects the CPU features of the **build machine** and compiles for those — meaning a binary built on a modern CPU may crash with `signal: illegal instruction (SIGILL)` when deployed to an older one. This is especially relevant when running the `worker` (`ggml-rpc-server`) on a different machine than the primary server.
 
 LlamaNexus explicitly disables CPU-specific instruction sets in its Dockerfiles to produce a portable binary that works across machines:
 
@@ -114,7 +116,7 @@ cmake .. \
 
 ### Diagnosing SIGILL on a worker machine
 
-If `rpc-server` crashes immediately after `ggml_cuda_init` with `signal: illegal instruction`, compare CPU flags between the build machine and the worker machine:
+If `ggml-rpc-server` crashes immediately after `ggml_cuda_init` with `signal: illegal instruction`, compare CPU flags between the build machine and the worker machine:
 
 ```bash
 cat /proc/cpuinfo | grep -m1 flags | tr ' ' '\n' | grep -E 'avx|fma|bmi'
@@ -175,6 +177,6 @@ Commercial uses is possible, but all code linked with GPL 3.0 source code must b
 
 ## Support
 
-If you find LlamaNexus useful, please consider supporting me as this software is developed on my free time and will always be open source and free of charge. Donations will be used to aquire a lots of coffee :) that plays important role during development!
+If you find LlamaNexus useful, please consider supporting me as this software is developed on my free time and will always be open source and free of charge. Donations will be used to aquire a lots of coffee :) that plays important role during development! Oh, and also some hardware if needed.
 
 https://www.paypal.com/paypalme/miikasyvanen
