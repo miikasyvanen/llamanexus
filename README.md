@@ -32,8 +32,8 @@ Open WebUI  --(Ollama / OpenAI API)-->  LlamaNexus  --(OpenAI-compatible API)-->
 
 Starts the proxy and the underlying `llama-server` router. This is the main mode, used in production via Docker Compose alongside Open WebUI.
 
-```bash
-llamanexus serve --llamaport 8080 --port 11434 -- [llama-server args...]
+```yaml
+command: serve --llamaport 8080 --port 11434 -- [llama-server args...]
 ```
 
 - `--port` — port LlamaNexus itself listens on (default `11434`, matching Ollama's default).
@@ -66,8 +66,8 @@ Prints a live percentage as the download progresses, then exits.
 
 Starts a `ggml-rpc-server` instance for distributed/multi-machine inference via llama.cpp's RPC backend. Used in a separate Docker Compose file (`docker-compose-worker.yml`) on machines contributing compute to a primary `serve` instance.
 
-```bash
-llamanexus worker --port 50052
+```yaml
+command: worker --port 50052
 ```
 
 ## Distributed inference and worker discovery
@@ -78,20 +78,20 @@ LlamaNexus supports two modes for connecting worker nodes to the primary server.
 
 Pass `--rpc` to `serve` with a comma-separated list of worker addresses. LlamaNexus starts `llama-server` immediately with those workers and does not listen for heartbeats.
 
-```bash
-llamanexus serve --rpc 192.168.0.120:50052,192.168.0.110:50052
+```yaml
+command: serve -- --rpc 192.168.0.120:50052,192.168.0.110:50052
 ```
 
 ### Auto-discovery mode
 
 Pass `--discovery` to both `serve` and `worker`. Workers broadcast a UDP heartbeat once per second; the serve node listens, discovers workers automatically, and passes them to `llama-server` as `--rpc` arguments.
 
-```bash
+```yaml
 # On each worker machine
-llamanexus --discovery worker
+command: worker --discovery
 
 # On the primary server
-llamanexus --discovery serve
+command: serve --discovery
 ```
 
 On startup, `serve` waits 8 seconds (configurable with `--discovery-wait`) to collect heartbeats, then starts `llama-server` with all discovered workers. After that the watcher keeps running in the background: if a new worker appears or an existing one stops sending heartbeats for 5 seconds, `llama-server` is automatically restarted with the updated worker list.
@@ -113,7 +113,9 @@ Discovery uses UDP broadcast (`255.255.255.255`), which requires containers to b
 services:
   llamanexus:
     network_mode: host
-  worker:
+
+services:
+  llamanexus-worker:
     network_mode: host
 ```
 
@@ -121,8 +123,8 @@ services:
 
 When running inside Docker, the auto-detected IP may resolve to a container bridge address (e.g. `172.19.0.x`) instead of the host\'s LAN IP. If that happens, override it explicitly:
 
-```bash
-llamanexus --discovery --advertise-addr 192.168.0.120 worker
+```yaml
+command: worker --discovery --advertise-addr 192.168.0.120
 ```
 
 Or via environment variable in your Compose file:
@@ -154,7 +156,7 @@ docker build --file Dockerfile.full -t llamanexus:full .
 ```
 
 When building and using local images, two lines needs to be changed in docker-compose.yml
-```bash
+```yaml
     image: llamanexus:beta
     pull_policy: never
 ```
