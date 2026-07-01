@@ -45,7 +45,7 @@ command: serve --llamaport 8080 --port 11434 -- [llama-server args...]
 One-shot CLI inference against a single model, without starting the full proxy/router. Downloads the model automatically if it isn't already cached.
 
 ```bash
-llamanexus run -m <repo>:<tag> -- -p "Your prompt here"
+docker exec -it llamanexus llamanexus run -m <repo>:<tag> -- -p "Your prompt here"
 ```
 
 - `-m` / `--model` — model identifier as `repo:tag`, e.g. `Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M`. The tag can be a quantization name (`Q4_K_M`) or an exact filename.
@@ -57,7 +57,7 @@ llamanexus run -m <repo>:<tag> -- -p "Your prompt here"
 Downloads a model from Hugging Face without running inference or starting the server. Useful for pre-warming the cache from a script or cron job.
 
 ```bash
-llamanexus pull <repo>:<tag>
+docker exec -it llamanexus llamanexus pull <repo>:<tag>
 ```
 
 Prints a live percentage as the download progresses, then exits.
