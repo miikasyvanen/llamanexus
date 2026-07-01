@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -137,6 +138,266 @@ type ModelPresetManager struct {
 	path string
 }
 
+// ---------------------------------------------------------------------------
+// RPC Worker Discovery
+// ---------------------------------------------------------------------------
+
+const discoveryDefaultPort = 50051
+
+// HeartbeatPacket is the UDP payload broadcast by worker nodes every second.
+type HeartbeatPacket struct {
+	Type    string `json:"type"`
+	Addr    string `json:"addr"`
+	Version string `json:"version"`
+}
+
+// RPCPeerRegistry is a thread-safe map of worker address -> last-seen time.
+// Entries older than peerTimeout are pruned automatically by the reaper goroutine.
+type RPCPeerRegistry struct {
+	sync.RWMutex
+	peers       map[string]time.Time
+	peerTimeout time.Duration
+}
+
+func NewRPCPeerRegistry(timeout time.Duration) *RPCPeerRegistry {
+	return &RPCPeerRegistry{
+		peers:       make(map[string]time.Time),
+		peerTimeout: timeout,
+	}
+}
+
+// Touch records (or refreshes) a peer address.
+// Touch records (or refreshes) a peer address. Returns true the first time an
+// address is seen, false on subsequent refreshes — useful for log dedup.
+func (r *RPCPeerRegistry) Touch(addr string) bool {
+	r.Lock()
+	defer r.Unlock()
+	_, seen := r.peers[addr]
+	r.peers[addr] = time.Now()
+	return !seen
+}
+
+// Reap removes peers that have not sent a heartbeat within peerTimeout.
+// Returns the number of peers pruned.
+func (r *RPCPeerRegistry) Reap() int {
+	r.Lock()
+	defer r.Unlock()
+	pruned := 0
+	for addr, last := range r.peers {
+		if time.Since(last) > r.peerTimeout {
+			fmt.Printf("[DISCOVERY] Worker timed out, removing: %s\n", addr)
+			delete(r.peers, addr)
+			pruned++
+		}
+	}
+	return pruned
+}
+
+// List returns a snapshot of all live peer addresses.
+func (r *RPCPeerRegistry) List() []string {
+	r.RLock()
+	defer r.RUnlock()
+	addrs := make([]string, 0, len(r.peers))
+	for addr := range r.peers {
+		addrs = append(addrs, addr)
+	}
+	return addrs
+}
+
+// outboundIP returns the IP address this host will use as the source of UDP
+// broadcast packets. Routing toward 255.255.255.255 causes the kernel to
+// select the LAN-facing interface (e.g. eth0 / 192.168.x.x) rather than a
+// Docker bridge interface (172.17.x.x / 172.19.x.x), which is what we want
+// so that other hosts on the same LAN can actually reach this worker.
+// No packets are sent — this is purely a routing-table query.
+func outboundIP() string {
+	conn, err := net.Dial("udp4", "255.255.255.255:50051")
+	if err != nil {
+		// Fallback: try a well-known external address; on plain hosts (no Docker)
+		// this also gives the right answer.
+		conn2, err2 := net.Dial("udp4", "8.8.8.8:80")
+		if err2 != nil {
+			return "127.0.0.1"
+		}
+		defer conn2.Close()
+		return conn2.LocalAddr().(*net.UDPAddr).IP.String()
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+// broadcastHeartbeat is run as a goroutine on worker nodes when --discovery is
+// active. It sends a UDP broadcast packet every second until stop is closed.
+// Requires network_mode: host (or equivalent) so the socket reaches the
+// physical LAN interface rather than a Docker bridge.
+func broadcastHeartbeat(rpcAddr string, discoveryPort int, stop <-chan struct{}) {
+	dst, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("255.255.255.255:%d", discoveryPort))
+	if err != nil {
+		fmt.Printf("[DISCOVERY] Cannot resolve broadcast address: %v\n", err)
+		return
+	}
+	conn, err := net.DialUDP("udp4", nil, dst)
+	if err != nil {
+		fmt.Printf("[DISCOVERY] Cannot open UDP socket for heartbeat: %v\n", err)
+		return
+	}
+	defer conn.Close()
+
+	pkt, _ := json.Marshal(HeartbeatPacket{
+		Type:    "rpc-heartbeat",
+		Addr:    rpcAddr,
+		Version: Version,
+	})
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	fmt.Printf("[DISCOVERY] Broadcasting heartbeat for %s on port %d\n", rpcAddr, discoveryPort)
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if _, err := conn.Write(pkt); err != nil {
+				fmt.Printf("[DISCOVERY] Heartbeat send error: %v\n", err)
+			}
+		}
+	}
+}
+
+// listenForWorkers is run as a goroutine on serve nodes when --discovery is
+// active. It listens for UDP broadcast heartbeats from worker nodes.
+// Requires network_mode: host so broadcast packets from other machines arrive
+// on the physical interface rather than being confined to a Docker bridge.
+func listenForWorkers(registry *RPCPeerRegistry, discoveryPort int, stop <-chan struct{}) {
+	addr := fmt.Sprintf("0.0.0.0:%d", discoveryPort)
+	pc, err := net.ListenPacket("udp4", addr)
+	if err != nil {
+		fmt.Printf("[DISCOVERY] Cannot listen on UDP %s: %v\n", addr, err)
+		return
+	}
+	defer pc.Close()
+
+	go func() {
+		<-stop
+		pc.Close()
+	}()
+
+	fmt.Printf("[DISCOVERY] Listening for broadcast heartbeats on %s\n", addr)
+	buf := make([]byte, 1024)
+	for {
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			// stop was triggered — exit cleanly
+			return
+		}
+		var pkt HeartbeatPacket
+		if err := json.Unmarshal(buf[:n], &pkt); err != nil {
+			continue
+		}
+		if pkt.Type != "rpc-heartbeat" || pkt.Addr == "" {
+			continue
+		}
+		if registry.Touch(pkt.Addr) {
+			fmt.Printf("[DISCOVERY] New worker found: %s (version %s)\n", pkt.Addr, pkt.Version)
+		}
+	}
+}
+
+// startPeerReaper runs a background goroutine that calls registry.Reap() every
+// second. Returns a stop channel the caller closes to halt the reaper.
+func startPeerReaper(registry *RPCPeerRegistry) chan struct{} {
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				registry.Reap()
+			}
+		}
+	}()
+	return stop
+}
+
+// sortedJoin sorts a slice of strings and joins them with commas.
+// Used to produce a stable --rpc argument so we can detect real roster changes
+// without being fooled by map iteration order differences.
+func sortedJoin(addrs []string) string {
+	sorted := make([]string, len(addrs))
+	copy(sorted, addrs)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	return strings.Join(sorted, ",")
+}
+
+// startDiscoveryWatcher starts the UDP listener and reaper, waits initialWait
+// for the first heartbeats to arrive, then launches llama-server with the
+// discovered workers. It continues running in the background: whenever the
+// live worker roster changes (new worker appears or one times out) it updates
+// llamaServer's args and restarts it automatically.
+//
+// baseArgs are the llama-server flags without --rpc (port, models-dir, preset,
+// any extra passthrough args). The watcher splices --rpc in/out as needed.
+func startDiscoveryWatcher(initialWait time.Duration, discoveryPort int, baseArgs []string, llamaServer *LlamaServerManager, waitForReady func()) {
+	registry := NewRPCPeerRegistry(5 * time.Second)
+
+	stopListener := make(chan struct{})
+	go listenForWorkers(registry, discoveryPort, stopListener)
+	_ = stopListener // listener runs for the lifetime of the process
+
+	stopReaper := startPeerReaper(registry)
+	_ = stopReaper // reaper runs for the lifetime of the process
+
+	// Give the listener a moment to bind, then wait for the initial scan window.
+	time.Sleep(50 * time.Millisecond)
+	fmt.Printf("[DISCOVERY] Listening for workers for %v...\n", initialWait)
+	time.Sleep(initialWait)
+
+	// Start llama-server with whatever workers showed up during the initial wait.
+	currentRoster := sortedJoin(registry.List())
+	llamaServer.SetArgs(baseArgs, currentRoster)
+	if currentRoster != "" {
+		fmt.Printf("[SERVE] Using discovered RPC workers: %s\n", currentRoster)
+	} else {
+		fmt.Println("[SERVE] No workers found, starting in single-node mode")
+	}
+	if err := llamaServer.Start(); err != nil {
+		fmt.Println("[ERROR] Failed to start llama-server:", err)
+		os.Exit(1)
+	}
+	waitForReady()
+
+	// Background loop: check for roster changes every second and restart if needed.
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
+			newRoster := sortedJoin(registry.List())
+			if newRoster == currentRoster {
+				continue
+			}
+			if newRoster == "" {
+				fmt.Println("[DISCOVERY] All workers lost, restarting in single-node mode")
+			} else if currentRoster == "" {
+				fmt.Printf("[DISCOVERY] Workers joined: %s\n", newRoster)
+			} else {
+				fmt.Printf("[DISCOVERY] Worker roster changed: %s -> %s\n", currentRoster, newRoster)
+			}
+			currentRoster = newRoster
+			llamaServer.SetArgs(baseArgs, currentRoster)
+			if err := llamaServer.RestartWithReason("worker roster changed"); err != nil {
+				fmt.Println("[ERROR] Failed to restart llama-server after roster change:", err)
+			}
+			waitForReady()
+		}
+	}()
+}
+
 // PullProgress is reported during a model download via downloadModel's
 // callback, letting callers (HTTP handler, CLI) render it however they like.
 type PullProgress struct {
@@ -155,6 +416,19 @@ func main() {
 	modelFlag := flag.StringP("model", "m", DefaultModel, "Specified GGUF model")
 	verboseFlag := flag.BoolP("verbose", "v", false, "Verbose mode")
 
+	// Manual RPC flag (serve): skip discovery and connect to explicit workers.
+	// Example: --rpc 192.168.0.120:50052,192.168.0.110:50052
+	rpcFlag := flag.StringP("rpc", "", "", "Comma-separated list of RPC worker addresses (host:port); disables discovery")
+
+	// Discovery flags
+	discoveryFlag := flag.BoolP("discovery", "", false, "Auto-discover RPC workers via UDP heartbeat (serve & worker)")
+	discoveryPortFlag := flag.IntP("discovery-port", "", discoveryDefaultPort, "UDP port used for worker heartbeat discovery")
+	discoveryWaitFlag := flag.DurationP("discovery-wait", "", 8*time.Second, "How long serve waits for worker heartbeats before starting llama-server")
+	// Explicit advertise address for worker nodes running inside Docker / NAT,
+	// where the auto-detected IP is a container bridge address rather than the
+	// host's LAN IP.  Example: --advertise-addr 192.168.0.120
+	advertiseAddrFlag := flag.StringP("advertise-addr", "", "", "IP (or host:port) to advertise in heartbeats; overrides auto-detection (useful inside Docker)")
+
 	flag.Parse()
 
 	fmt.Printf("[INFO] Starting LlamaNexus version %s\n", Version)
@@ -164,6 +438,11 @@ func main() {
 	rpcport := *rpcPortFlag
 	verbose := *verboseFlag
 	model := *modelFlag
+	rpcAddrs := *rpcFlag
+	discovery := *discoveryFlag
+	discoveryPort := *discoveryPortFlag
+	discoveryWait := *discoveryWaitFlag
+	advertiseAddr := *advertiseAddrFlag
 
 	args := flag.Args()
 	command := ""
@@ -176,7 +455,7 @@ func main() {
 
 	if command == "serve" {
 		fmt.Printf("[SERVE] Starting llama-server: port=%d llama port=%d verbose=%t\n", port, llamaport, verbose)
-		runServe(port, llamaport, verbose, args[1:])
+		runServe(port, llamaport, verbose, rpcAddrs, discovery, discoveryPort, discoveryWait, args[1:])
 	} else if command == "run" {
 		fmt.Printf("[RUN] Starting llama-cli: model=%s verbose=%t\n", model, verbose)
 		runCliInference(model, verbose, args[1:])
@@ -187,8 +466,8 @@ func main() {
 		}
 		runPull(args[1], verbose)
 	} else if command == "worker" {
-		fmt.Printf("[WORKER] Starting worker: port=%d\n", rpcport)
-		runRpcServer(rpcport, args[1:])
+		fmt.Printf("[WORKER] Starting worker: port=%d discovery=%t\n", rpcport, discovery)
+		runRpcServer(rpcport, discovery, discoveryPort, advertiseAddr, args[1:])
 	} else {
 		flag.Usage()
 		os.Exit(1)
@@ -342,6 +621,35 @@ func (m *LlamaServerManager) Restart() error {
 		_, _ = proc.Process.Wait() // reap, avoid zombie
 	}
 
+	return m.Start()
+}
+
+// SetArgs replaces the argument list used for the next Start/Restart call.
+// The base args (port, models-dir, preset) are passed in; this method slots
+// the --rpc value in or removes it depending on whether rpcAddrs is empty.
+func (m *LlamaServerManager) SetArgs(baseArgs []string, rpcAddrs string) {
+	m.Lock()
+	defer m.Unlock()
+	args := make([]string, len(baseArgs))
+	copy(args, baseArgs)
+	if rpcAddrs != "" {
+		args = append(args, "--rpc", rpcAddrs)
+	}
+	m.args = args
+}
+
+// RestartWithReason kills the running process and starts a fresh one using
+// the current m.args. The reason string is included in the log line.
+func (m *LlamaServerManager) RestartWithReason(reason string) error {
+	m.Lock()
+	proc := m.cmd
+	m.Unlock()
+
+	if proc != nil && proc.Process != nil {
+		fmt.Printf("[LLAMA-SERVER] Restarting: %s\n", reason)
+		_ = proc.Process.Kill()
+		_, _ = proc.Process.Wait()
+	}
 	return m.Start()
 }
 
@@ -590,7 +898,7 @@ func getBinaryPath(name string) string {
 	return ""
 }
 
-func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
+func runServe(port int, llamaport int, verbose bool, rpcAddrs string, discovery bool, discoveryPort int, discoveryWait time.Duration, promptArgs []string) {
 	llamaBaseURL := fmt.Sprintf("http://localhost:%d", llamaport)
 
 	home, _ := os.UserHomeDir()
@@ -622,14 +930,12 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 	}
 
 	serverBin := getBinaryPath("llama-server")
-	args := []string{"--port", strconv.Itoa(llamaport), "--models-dir", hfModelsDir, "--models-preset", presetMgr.path}
-	args = append(args, promptArgs...)
+	// baseArgs holds everything except --rpc, which is managed dynamically by
+	// the discovery watcher (or set once here in manual/no-discovery mode).
+	baseArgs := []string{"--port", strconv.Itoa(llamaport), "--models-dir", hfModelsDir, "--models-preset", presetMgr.path}
+	baseArgs = append(baseArgs, promptArgs...)
 
-	llamaServer := &LlamaServerManager{serverBin: serverBin, args: args}
-	if err := llamaServer.Start(); err != nil {
-		fmt.Println("[ERROR] Failed to start llama-server:", err)
-		os.Exit(1)
-	}
+	llamaServer := &LlamaServerManager{serverBin: serverBin}
 	defer func() {
 		llamaServer.Lock()
 		if llamaServer.cmd != nil && llamaServer.cmd.Process != nil {
@@ -637,6 +943,34 @@ func runServe(port int, llamaport int, verbose bool, promptArgs []string) {
 		}
 		llamaServer.Unlock()
 	}()
+
+	// --- RPC worker resolution ---
+	// Manual mode: --rpc takes precedence over discovery; start immediately.
+	// Discovery mode: hand off to startDiscoveryWatcher which handles the
+	//   initial scan, the first llama-server Start(), and all future restarts.
+	// Neither: start single-node immediately.
+	if rpcAddrs != "" {
+		fmt.Printf("[SERVE] Manual RPC workers: %s\n", rpcAddrs)
+		llamaServer.SetArgs(baseArgs, rpcAddrs)
+		if err := llamaServer.Start(); err != nil {
+			fmt.Println("[ERROR] Failed to start llama-server:", err)
+			os.Exit(1)
+		}
+	} else if discovery {
+		// startDiscoveryWatcher blocks for initialWait, then starts llama-server
+		// and watches for roster changes in the background. It does NOT return.
+		// We run it in a goroutine so http.ListenAndServe can start below.
+		waitReady := func() { waitForRouterReady(llamaBaseURL, 10*time.Second) }
+		go startDiscoveryWatcher(discoveryWait, discoveryPort, baseArgs, llamaServer, waitReady)
+		// Block until llama-server is up before we begin serving HTTP traffic.
+		waitForRouterReady(llamaBaseURL, discoveryWait+15*time.Second)
+	} else {
+		llamaServer.SetArgs(baseArgs, "")
+		if err := llamaServer.Start(); err != nil {
+			fmt.Println("[ERROR] Failed to start llama-server:", err)
+			os.Exit(1)
+		}
+	}
 
 	http.HandleFunc("/ollama/api/pull", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1301,16 +1635,46 @@ func runCliInference(model string, verbose bool, promptArgs []string) {
 	}
 }
 
-func runRpcServer(port int, promptArgs []string) {
+func runRpcServer(port int, discovery bool, discoveryPort int, advertiseAddr string, promptArgs []string) {
 	rpcBin := getBinaryPath("rpc-server")
 	args := []string{"-H", "0.0.0.0", "-p", strconv.Itoa(port)}
 	args = append(args, promptArgs...)
 	cmd := exec.Command(rpcBin, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	fmt.Printf("[WORKER] RPC-server active: port=%d...\n", port)
+
+	// Start the heartbeat broadcaster before launching rpc-server so that
+	// serve nodes scanning at startup can already see this worker.
+	var stopHeartbeat chan struct{}
+	if discovery {
+		// Resolve the address to advertise in heartbeats.
+		// Priority: --advertise-addr flag > LLAMANEXUS_ADVERTISE_ADDR env var > auto-detect.
+		// Auto-detection routes toward 255.255.255.255 to prefer the LAN interface
+		// over Docker bridge IPs, but an explicit override is always safer in
+		// complex network topologies (multi-NIC, VLAN, macvlan, host-network, etc.).
+		rpcAddr := advertiseAddr
+		if rpcAddr == "" {
+			rpcAddr = os.Getenv("LLAMANEXUS_ADVERTISE_ADDR")
+		}
+		if rpcAddr == "" {
+			rpcAddr = outboundIP()
+		}
+		// If the value has no port (e.g. "192.168.0.120"), append the RPC port.
+		if !strings.Contains(rpcAddr, ":") {
+			rpcAddr = fmt.Sprintf("%s:%d", rpcAddr, port)
+		}
+		fmt.Printf("[WORKER] Advertising RPC address: %s\n", rpcAddr)
+		stopHeartbeat = make(chan struct{})
+		go broadcastHeartbeat(rpcAddr, discoveryPort, stopHeartbeat)
+	}
+
+	fmt.Printf("[WORKER] RPC-server active: port=%d discovery=%t...\n", port, discovery)
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("[WORKER] rpc-server exited: %v\n", err)
-		os.Exit(1)
+	}
+
+	// Stop heartbeat after the rpc-server process exits.
+	if stopHeartbeat != nil {
+		close(stopHeartbeat)
 	}
 }
